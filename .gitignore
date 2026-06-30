@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+output/
+data/
+*.log
+*.db
+.DS_Store
+.env
+.gemini/

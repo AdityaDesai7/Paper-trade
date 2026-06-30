@@ -1,0 +1,28 @@
+# ============================================================================
+# PETROQUANT PAPER TRADING — DEPENDENCIES
+# ============================================================================
+# Install with: pip install -r paper_trading/requirements_paper.txt
+
+# Core data
+yfinance>=0.2.40
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Machine learning
+xgboost>=2.0.0
+scikit-learn>=1.3.0
+
+# HMM regime detection (same as main PetroQuant)
+hmmlearn>=0.3.0
+
+# Web server
+flask>=3.0.0
+
+# Timezone handling
+pytz>=2024.1
+
+# ARCH (GARCH) — optional, used by volatility engine
+arch>=6.0.0
+
+# Plotting / Dashboard
+plotly>=5.20.0
