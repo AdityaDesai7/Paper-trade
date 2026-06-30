@@ -112,7 +112,7 @@ class LiveDashboard:
             specs=[
                 [{"type": "scatter"}, {"type": "scatter"}],
                 [{"type": "bar"},     {"type": "scatter"}],
-                [{"type": "scatter"}, {"type": "table"}],
+                [{"type": "scatter"}, {"type": "domain"}],
                 [{"type": "histogram"}, {"type": "bar"}],
                 [{"type": "scatter"}, {"type": "scatter"}],
             ]
