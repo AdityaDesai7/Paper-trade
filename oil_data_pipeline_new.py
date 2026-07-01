@@ -20,6 +20,8 @@ import os
 import glob
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+load_dotenv()  # Explicitly load .env variables into environment
+
 import warnings
 warnings.filterwarnings('ignore')
 
