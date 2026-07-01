@@ -343,31 +343,30 @@ XGBoost (Extreme Gradient Boosting) is a machine learning algorithm that builds 
 
 In quantitative finance, XGBoost is widely used because it handles mixed data types well (prices, percentages, z-scores), is resistant to overfitting when properly configured, and can capture non-linear relationships (for example, "rising oil prices combined with rising OVX indicates trouble, but rising prices with falling OVX indicates healthy growth").
 
-#### What Is Walk-Forward Validation?
+#### What Is Walk-Forward Validation (and how is it used here)?
 
-This is where the system distinguishes itself from naive approaches. Many beginner machine learning projects train a model on all historical data and then test it on the same data. This produces misleadingly good results because the model has already "seen" the answers.
+This is where PetroQuant distinguishes itself from naive approaches. Many beginner machine learning projects train a model on all historical data and then test it on the same data. This produces misleadingly good results because the model has already "seen" the answers (look-ahead bias).
 
-Walk-forward validation works differently:
+**Walk-forward validation** works by simulating how a real trader operates: you can only train on the past, and you are always predicting the unknown future. As time moves forward, the model periodically pauses to "re-learn" from the newly revealed data before predicting the next batch.
 
-1. Train the model on the first 500 days of data
-2. Use that trained model to predict the next 63 days (one quarter)
-3. Now train a new model on the first 563 days
-4. Predict the next 63 days
-5. Repeat until all data is covered
+PetroQuant uses two distinct walk-forward cycles depending on the timeframe:
 
-This mimics how a real trader would use the system: you can only train on the past, and you are always predicting the future. The model is never tested on data it was trained on.
+**1. The Daily Strategy (Backtesting)**
+For the daily-resolution model, we use a quarterly (63 trading days) walk-forward cycle:
+1. Train the model on the first 500 days of historical data.
+2. Use that trained model to predict the next 63 days (one quarter).
+3. Roll forward: Train a new model on the first 563 days.
+4. Predict the next 63 days.
+5. Repeat until all historical data is covered.
 
-```
-Example timeline:
+**2. The Intraday Strategy (Live Paper Trading)**
+For the live 1-minute paper trading engine, the market moves much faster, so the walk-forward cycle is accelerated:
+1. The engine fetches the last ~7 days of 1-minute bars (approx. 5,000+ bars).
+2. It trains the XGBoost model on this recent window.
+3. The model predicts the WTI price direction for the next 5 minutes to take a live trade.
+4. **Every 4 hours (240 minutes)**, the system automatically triggers a walk-forward retrain. It grabs the newest 1-minute bars that just occurred and rebuilds the model so it adapts to the intraday momentum of that specific session.
 
-Days 1-500:     TRAINING (model learns patterns from 2021-2023)
-Days 501-563:   TESTING  (model predicts Jan-Mar 2024, never seen before)
-Days 1-563:     TRAINING (model now includes the test period for next round)
-Days 564-626:   TESTING  (model predicts Apr-Jun 2024)
-...and so on
-```
-
-**Why retrain every 63 days?** Markets evolve. The relationship between the dollar and oil prices in 2022 is not identical to 2024. By retraining quarterly, the model adapts to changing market dynamics while still using enough historical data to learn stable patterns.
+**Why walk-forward?** Markets evolve constantly. The relationship between volatility and oil prices in a 2022 panic is not identical to a calm day in 2024. By continuously retraining as time walks forward, the model adapts to changing market dynamics without ever cheating by looking into the future.
 
 #### The Prediction Target
 
