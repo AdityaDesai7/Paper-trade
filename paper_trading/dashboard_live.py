@@ -350,7 +350,7 @@ class LiveDashboard:
         <div class="dcard-title">XGBoost Model</div>
         {'<div class="dkv"><span>Status</span><strong style="color:#2ea043">Trained</strong></div>' if model_trained else '<div class="dkv"><span>Status</span><strong style="color:#f85149">Not trained yet</strong></div>'}
         {'<div class="dkv"><span>Val Accuracy</span><strong style="color:' + acc_color + '">' + f'{model_acc:.2%}</strong></div>' if model_trained else ''}
-        {'<div class="dkv"><span>Retrain In</span><strong>' + f'{model_retrain:.0f}m</strong></div>' if model_trained else ''}
+        {'<div class="dkv"><span>Retrain In</span><strong>' + f'{model_retrain:.0f}m (or post-trade)</strong></div>' if model_trained else ''}
         {'<div class="dkv"><span>Bars Trained</span><strong>' + str(model.get("n_train_bars", 0)) + '</strong></div>' if model_trained else ''}
         {'<div class="dkv"><span>Features</span><strong>' + str(model.get("n_features", 0)) + '</strong></div>' if model_trained else ''}
       </div>
