@@ -24,6 +24,8 @@
 
 import threading
 import numpy as np
+import json
+import os
 from datetime import datetime, date
 from dataclasses import dataclass, field
 from typing import Optional
@@ -76,13 +78,15 @@ class Portfolio:
                  commission_pct   : float = cfg.COMMISSION_PCT,
                  slippage_pct     : float = cfg.SLIPPAGE_PCT,
                  max_position_pct : float = cfg.MAX_POSITION_PCT,
-                 max_daily_loss   : float = cfg.MAX_DAILY_LOSS_PCT):
+                 max_daily_loss   : float = cfg.MAX_DAILY_LOSS_PCT,
+                 backup_dir       : str   = None):
 
         self.initial_capital  = initial_capital
         self.commission_pct   = commission_pct
         self.slippage_pct     = slippage_pct
         self.max_position_pct = max_position_pct
         self.max_daily_loss   = max_daily_loss
+        self._backup_dir      = backup_dir   # per-TF JSON backup directory
 
         # Thread safety — trading loop and web server both access portfolio
         self._lock            = threading.RLock()
@@ -163,6 +167,105 @@ class Portfolio:
                 logger.error(f"[Portfolio] restore_from_db failed: {e}")
                 return False
 
+    def save_state_to_json(self, backup_path: str = None) -> None:
+        """
+        Save full portfolio state to a JSON file.
+        Called after every trade so state can be recovered if the DB is lost
+        (e.g. on Render/Railway ephemeral filesystem restarts).
+        """
+        with self._lock:
+            try:
+                backup_dir = backup_path or self._backup_dir or cfg.STATE_BACKUP_DIR
+                os.makedirs(backup_dir, exist_ok=True)
+                state = {
+                    'cash'             : self.cash,
+                    'initial_capital'  : self.initial_capital,
+                    'realized_pnl'     : self.realized_pnl,
+                    'total_commission' : self.total_commission,
+                    'total_trades'     : self.total_trades,
+                    'winning_trades'   : self.winning_trades,
+                    'losing_trades'    : self.losing_trades,
+                    'total_win_pnl'    : self.total_win_pnl,
+                    'total_loss_pnl'   : self.total_loss_pnl,
+                    'saved_at'         : datetime.utcnow().isoformat(),
+                }
+                # Include open position if any
+                if self.position is not None:
+                    state['open_position'] = {
+                        'side'       : self.position.side,
+                        'qty'        : self.position.qty,
+                        'entry_price': self.position.entry_price,
+                        'entry_time' : self.position.entry_time.isoformat(),
+                        'commission' : self.position.commission,
+                    }
+                # Write to a temp file first, then rename for atomicity
+                filepath = os.path.join(backup_dir, f'portfolio_state.json')
+                tmp_path = filepath + '.tmp'
+                with open(tmp_path, 'w') as f:
+                    json.dump(state, f, indent=2)
+                os.replace(tmp_path, filepath)
+                logger.debug(f"[Portfolio] State saved to {filepath}")
+            except Exception as e:
+                logger.error(f"[Portfolio] save_state_to_json failed: {e}")
+
+    def restore_from_json(self, backup_path: str = None) -> bool:
+        """
+        Restore portfolio state from a JSON backup file.
+        Used as a fallback when the SQLite DB is lost/empty.
+
+        Returns True if restoration succeeded, False if no backup found.
+        """
+        with self._lock:
+            try:
+                backup_dir = backup_path or self._backup_dir or cfg.STATE_BACKUP_DIR
+                filepath = os.path.join(backup_dir, 'portfolio_state.json')
+                if not os.path.exists(filepath):
+                    logger.info("[Portfolio] No JSON backup found")
+                    return False
+
+                with open(filepath, 'r') as f:
+                    state = json.load(f)
+
+                self.cash             = state['cash']
+                self.realized_pnl     = state['realized_pnl']
+                self.total_commission = state['total_commission']
+                self.total_trades     = state['total_trades']
+                self.winning_trades   = state['winning_trades']
+                self.losing_trades    = state['losing_trades']
+                self.total_win_pnl    = state['total_win_pnl']
+                self.total_loss_pnl   = state['total_loss_pnl']
+                self._day_start_equity= self.cash
+
+                # Restore open position if it existed
+                if 'open_position' in state:
+                    pos_data = state['open_position']
+                    self.position = Position(
+                        side        = pos_data['side'],
+                        qty         = pos_data['qty'],
+                        entry_price = pos_data['entry_price'],
+                        entry_time  = datetime.fromisoformat(pos_data['entry_time']),
+                        commission  = pos_data.get('commission', 0.0),
+                    )
+                    logger.info(
+                        f"[Portfolio] Restored open {pos_data['side']} position: "
+                        f"{pos_data['qty']:.4f} units @ ${pos_data['entry_price']:.4f}"
+                    )
+                else:
+                    self.position = None
+
+                logger.info(
+                    f"[Portfolio] Restored from JSON backup | "
+                    f"cash=${self.cash:,.2f} | "
+                    f"realized_pnl=${self.realized_pnl:+,.2f} | "
+                    f"trades={self.total_trades} | "
+                    f"saved_at={state.get('saved_at', 'unknown')}"
+                )
+                return True
+
+            except Exception as e:
+                logger.error(f"[Portfolio] restore_from_json failed: {e}")
+                return False
+
     # ── Position Sizing ───────────────────────────────────────────────────────
     def position_size_units(self, price: float, regime_mult: float = 1.0,
                              confidence: float = 0.5) -> float:
@@ -224,6 +327,9 @@ class Portfolio:
             logger.info(f"[Portfolio] OPEN LONG  {qty:.4f} units @ ${fill_price:.4f} "
                         f"| cost=${cost:.2f} | commission=${commission:.2f} | cash=${self.cash:,.2f}")
 
+            # Persist state after trade
+            self.save_state_to_json()
+
             return {
                 'status'     : 'filled',
                 'side'       : 'LONG',
@@ -262,6 +368,9 @@ class Portfolio:
             logger.info(f"[Portfolio] OPEN SHORT {qty:.4f} units @ ${fill_price:.4f} "
                         f"| notional=${notional:.2f} | commission=${commission:.2f} "
                         f"| cash=${self.cash:,.2f}")
+
+            # Persist state after trade
+            self.save_state_to_json()
 
             return {
                 'status'     : 'filled',
@@ -314,6 +423,9 @@ class Portfolio:
             logger.info(f"[Portfolio] CLOSE {closed_position.side} {closed_position.qty:.4f} "
                         f"@ ${fill_price:.4f} | P&L=${net_pnl:+.2f} "
                         f"| total_realized=${self.realized_pnl:+.2f}")
+
+            # Persist state after trade
+            self.save_state_to_json()
 
             return {
                 'status'      : 'closed',

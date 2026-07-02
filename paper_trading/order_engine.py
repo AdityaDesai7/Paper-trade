@@ -34,11 +34,13 @@ class OrderEngine:
     ----------
     portfolio  : Portfolio  — the paper account to trade on
     trade_log  : TradeLog   — SQLite logger for all fills and snapshots
+    model      : IntradaySignalModel — model reference for trade-triggered retraining
     """
 
-    def __init__(self, portfolio: Portfolio, trade_log: TradeLog):
+    def __init__(self, portfolio: Portfolio, trade_log: TradeLog, model=None):
         self.portfolio    = portfolio
         self.trade_log    = trade_log
+        self._model       = model     # for calling mark_trade_completed()
         self._last_signal = 'HOLD'    # track last executed signal to avoid churning
 
     # ── Main Execute ──────────────────────────────────────────────────────────
@@ -125,6 +127,10 @@ class OrderEngine:
             snapshot_after = portfolio.get_snapshot(price)
             log.log_snapshot(bar_time, snapshot_after, regime, signal, probability)
 
+            # Mark trade for model retraining
+            if self._model is not None:
+                self._model.mark_trade_completed()
+
             logger.info(f"[OrderEngine] {action} | price=${price:.4f} | "
                         f"pnl=${close_result.get('net_pnl', 0):+.2f} | "
                         f"equity=${snapshot_after['equity']:,.2f} | regime={regime}")
@@ -172,6 +178,10 @@ class OrderEngine:
                 notes         = f'regime={regime} mult={regime_mult}'
             )
             self._last_signal = signal
+
+            # Mark trade for model retraining
+            if self._model is not None:
+                self._model.mark_trade_completed()
         else:
             logger.warning(f"[OrderEngine] Open {action} rejected: {open_result.get('reason')}")
 

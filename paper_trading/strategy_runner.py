@@ -79,15 +79,18 @@ class StrategyRunner:
         # ── Per-TF SQLite database ───────────────────────────────────────────
         db_path = os.path.join(cfg.OUTPUT_DIR, f'paper_trades_{timeframe}.db')
 
+        # ── Per-TF JSON backup directory ──────────────────────────────────────
+        self._backup_dir = os.path.join(cfg.STATE_BACKUP_DIR, timeframe)
+
         # ── Independent components — never shared with other runners ─────────
         self.trade_log    = TradeLog(db_path=db_path)
-        self.portfolio    = Portfolio(initial_capital=cfg.INITIAL_CAPITAL)
-        self.order_engine = OrderEngine(self.portfolio, self.trade_log)
+        self.portfolio    = Portfolio(initial_capital=cfg.INITIAL_CAPITAL, backup_dir=self._backup_dir)
         self.model        = IntradaySignalModel(
             horizon            = self._horizon,
             min_train_bars     = self._min_train_bars,
             retrain_every_mins = self._retrain_mins,
         )
+        self.order_engine = OrderEngine(self.portfolio, self.trade_log, self.model)
         self.regime_det = DailyRegimeDetector()
 
         # ── Live state (read by web server / dashboard) ──────────────────────
@@ -104,12 +107,17 @@ class StrategyRunner:
         self._stop_event = threading.Event()
         self._start_time = None
 
-        # ── Restore state from DB (survives server restarts) ─────────────────
+        # ── Restore state from DB, then JSON fallback ────────────────────────
         restored = self.portfolio.restore_from_db(self.trade_log)
         if restored:
             logger.info(f"[{timeframe}] Portfolio restored from DB")
         else:
-            logger.info(f"[{timeframe}] Fresh start — no prior trade history")
+            # DB was empty — try JSON backup (survives ephemeral filesystem wipes)
+            json_restored = self.portfolio.restore_from_json(self._backup_dir)
+            if json_restored:
+                logger.info(f"[{timeframe}] Portfolio restored from JSON backup")
+            else:
+                logger.info(f"[{timeframe}] Fresh start — no prior trade history")
 
         logger.info(
             f"[{timeframe}] StrategyRunner ready — "
@@ -164,13 +172,20 @@ class StrategyRunner:
         with self.trade_log._get_conn() as conn:
             conn.execute("DELETE FROM trades")
             conn.execute("DELETE FROM snapshots")
-        self.portfolio    = Portfolio(initial_capital=cfg.INITIAL_CAPITAL)
-        self.order_engine = OrderEngine(self.portfolio, self.trade_log)
+        self.portfolio    = Portfolio(initial_capital=cfg.INITIAL_CAPITAL, backup_dir=self._backup_dir)
         self.model        = IntradaySignalModel(
             horizon            = self._horizon,
             min_train_bars     = self._min_train_bars,
             retrain_every_mins = self._retrain_mins,
         )
+        self.order_engine = OrderEngine(self.portfolio, self.trade_log, self.model)
+
+        # Also clear JSON backup so reset is truly clean
+        import shutil
+        if os.path.exists(self._backup_dir):
+            shutil.rmtree(self._backup_dir, ignore_errors=True)
+            logger.info(f"[{self.timeframe}] Cleared JSON backup at {self._backup_dir}")
+
         logger.warning(
             f"[{self.timeframe}] Strategy RESET — trades cleared, "
             f"portfolio restarted at ${cfg.INITIAL_CAPITAL:,.0f}"

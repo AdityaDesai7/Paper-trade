@@ -68,6 +68,7 @@ class IntradaySignalModel:
         self._n_train_bars       = 0
         self._is_trained         = False
         self._feature_importance = None
+        self._trade_since_last_train = False   # Set by mark_trade_completed()
         # Protects _model + _scaler from concurrent train() calls
         self._train_lock         = threading.Lock()
 
@@ -177,6 +178,7 @@ class IntradaySignalModel:
             self._last_train_acc     = val_acc
             self._n_train_bars       = len(X_train)
             self._is_trained         = True
+            self._trade_since_last_train = False   # Reset trade flag after successful train
 
         acc_grade = ('GOOD' if val_acc > 0.55 else
                      'FAIR' if val_acc > 0.52 else 'WEAK')
@@ -251,12 +253,27 @@ class IntradaySignalModel:
         Triggers if:
           - Never been trained
           - More than retrain_every_mins have passed since last training
+          - A trade was completed since last training (when RETRAIN_AFTER_TRADE is True)
         """
         if not self._is_trained or self._last_train_time is None:
             return True
 
+        # Trade-triggered retraining
+        if cfg.RETRAIN_AFTER_TRADE and self._trade_since_last_train:
+            logger.info("[Model] Trade completed since last train — will retrain")
+            return True
+
         elapsed_mins = (datetime.utcnow() - self._last_train_time).total_seconds() / 60
         return elapsed_mins >= self.retrain_every_mins
+
+    def mark_trade_completed(self) -> None:
+        """
+        Called by OrderEngine after a trade (OPEN or CLOSE) is executed.
+        Sets a flag so should_retrain() returns True on the next cycle,
+        ensuring the model retrains with the latest market context.
+        """
+        self._trade_since_last_train = True
+        logger.info("[Model] Trade completed — marked for retraining on next cycle")
 
     # ── Accessors ─────────────────────────────────────────────────────────────
     def get_feature_importance(self) -> pd.Series | None:

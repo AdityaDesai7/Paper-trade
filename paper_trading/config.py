@@ -17,8 +17,8 @@ INITIAL_CAPITAL    = 1_000_000      # Starting paper account in USD
 CURRENCY           = "USD"
 
 # ── Signal / Prediction ──────────────────────────────────────────────────────
-BUY_THRESHOLD      = 0.52           # Model prob > 52% -> BUY
-SELL_THRESHOLD     = 0.48           # Model prob < 48% -> SELL
+BUY_THRESHOLD      = 0.55           # Model prob > 52% -> BUY
+SELL_THRESHOLD     = 0.45           # Model prob < 48% -> SELL
 
 # ── Execution / Risk ─────────────────────────────────────────────────────────
 COMMISSION_PCT     = 0.0002         # 2 basis points per side
@@ -56,6 +56,17 @@ OUTPUT_DIR         = os.path.join(BASE_DIR, 'output')
 DB_PATH            = os.path.join(OUTPUT_DIR, 'paper_trades.db')
 LOG_PATH           = os.path.join(OUTPUT_DIR, 'paper_trading.log')
 DASHBOARD_PATH     = os.path.join(OUTPUT_DIR, 'paper_dashboard.html')
+
+# ── Persistent State Backup ─────────────────────────────────────────────
+# JSON state snapshots saved after every trade — survives process restarts.
+# If the SQLite DB is lost (e.g. ephemeral filesystem), state is restored
+# from these JSON files instead.
+STATE_BACKUP_DIR   = os.path.join(OUTPUT_DIR, 'state_backups')
+
+# ── Model Retraining ────────────────────────────────────────────────────
+# When True, the model retrains at the start of the next cycle after any
+# completed trade (OPEN or CLOSE), in addition to the time-based schedule.
+RETRAIN_AFTER_TRADE = True
 
 # ── Web Server ───────────────────────────────────────────────────────────────
 WEB_PORT           = int(os.environ.get('PORT', 8080))
