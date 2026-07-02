@@ -18,6 +18,7 @@
 #   get_model_status()      — returns dict with training metadata
 # ============================================================================
 
+import threading
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -67,6 +68,8 @@ class IntradaySignalModel:
         self._n_train_bars       = 0
         self._is_trained         = False
         self._feature_importance = None
+        # Protects _model + _scaler from concurrent train() calls
+        self._train_lock         = threading.Lock()
 
     def refresh_from_config(self) -> None:
         """
@@ -81,9 +84,16 @@ class IntradaySignalModel:
                     f"retrain_mins={self.retrain_every_mins}")
 
     # ── Training ─────────────────────────────────────────────────────────────
+    # Minimum val_acc required before a fresh model is accepted.
+    # Below this threshold the engine stays with the last good model (or HOLD).
+    MIN_ACCEPTABLE_ACC = 0.48
+
     def train(self, feat_df: pd.DataFrame) -> dict:
         """
         Train XGBoost on the provided feature DataFrame.
+
+        Thread-safe: serialised by _train_lock so rapid timeframe switches
+        cannot produce a NotFittedError from concurrent train() calls.
 
         Parameters
         ----------
@@ -102,67 +112,89 @@ class IntradaySignalModel:
             return {'status': 'skipped', 'reason': 'not enough bars',
                     'have': len(feat_df), 'need': self.min_train_bars}
 
-        # ── Select features ──────────────────────────────────────────────────
-        self._feature_cols = get_feature_columns(feat_df)
-        X = feat_df[self._feature_cols].values
-        y = feat_df['Target'].values
+        with self._train_lock:
+            # ── Select features ───────────────────────────────────────────
+            feature_cols = get_feature_columns(feat_df)
+            X = feat_df[feature_cols].values
+            y = feat_df['Target'].values
 
-        # ── Train / validation split (80/20, time-ordered) ──────────────────
-        split     = int(len(X) * 0.80)
-        X_train   = X[:split]
-        y_train   = y[:split]
-        X_val     = X[split:]
-        y_val     = y[split:]
+            # ── Train / validation split (80/20, time-ordered) ───────────
+            split     = int(len(X) * 0.80)
+            X_train   = X[:split]
+            y_train   = y[:split]
+            X_val     = X[split:]
+            y_val     = y[split:]
 
-        # ── Scale ────────────────────────────────────────────────────────────
-        self._scaler  = StandardScaler()
-        X_train_s = self._scaler.fit_transform(X_train)
-        X_val_s   = self._scaler.transform(X_val)
+            # ── Scale ─────────────────────────────────────────────────────
+            scaler    = StandardScaler()
+            X_train_s = scaler.fit_transform(X_train)
+            X_val_s   = scaler.transform(X_val)
 
-        # ── XGBoost — calibrated for intraday noise ───────────────────────
-        self._model = XGBClassifier(
-            max_depth        = 3,
-            n_estimators     = 200,
-            learning_rate    = 0.05,
-            subsample        = 0.7,
-            colsample_bytree = 0.7,
-            min_child_weight = 10,
-            reg_alpha        = 0.1,
-            reg_lambda       = 1.0,
-            objective        = 'binary:logistic',
-            eval_metric      = 'logloss',
-            random_state     = 42,
-            verbosity        = 0,
-        )
+            # ── XGBoost — calibrated for intraday noise ───────────────────
+            model = XGBClassifier(
+                max_depth        = 3,
+                n_estimators     = 200,
+                learning_rate    = 0.05,
+                subsample        = 0.7,
+                colsample_bytree = 0.7,
+                min_child_weight = 10,
+                reg_alpha        = 0.1,
+                reg_lambda       = 1.0,
+                objective        = 'binary:logistic',
+                eval_metric      = 'logloss',
+                random_state     = 42,
+                verbosity        = 0,
+            )
 
-        self._model.fit(
-            X_train_s, y_train,
-            eval_set = [(X_val_s, y_val)],
-            verbose  = False,
-        )
+            model.fit(
+                X_train_s, y_train,
+                eval_set = [(X_val_s, y_val)],
+                verbose  = False,
+            )
 
-        # ── Validation accuracy ───────────────────────────────────────────
-        val_preds = (self._model.predict_proba(X_val_s)[:, 1] > 0.5).astype(int)
-        val_acc   = accuracy_score(y_val, val_preds) if len(y_val) > 0 else 0.5
+            # ── Validation accuracy ────────────────────────────────────────
+            val_preds = (model.predict_proba(X_val_s)[:, 1] > 0.5).astype(int)
+            val_acc   = accuracy_score(y_val, val_preds) if len(y_val) > 0 else 0.5
 
-        # ── Feature importance ────────────────────────────────────────────
-        self._feature_importance = pd.Series(
-            self._model.feature_importances_,
-            index=self._feature_cols
-        ).sort_values(ascending=False)
+            # ── Accuracy gate — reject models worse than random ───────────
+            if val_acc < self.MIN_ACCEPTABLE_ACC:
+                logger.warning(
+                    f"[Model] val_acc={val_acc:.2%} is below minimum "
+                    f"{self.MIN_ACCEPTABLE_ACC:.0%} — model rejected, "
+                    f"keeping previous model (engine will HOLD)."
+                )
+                return {
+                    'status'     : 'rejected',
+                    'reason'     : 'below_min_accuracy',
+                    'val_accuracy': val_acc,
+                    'threshold'  : self.MIN_ACCEPTABLE_ACC,
+                    'n_train_bars': len(X_train),
+                    'n_val_bars' : len(X_val),
+                    'n_features' : len(feature_cols),
+                }
 
-        # ── Update state ──────────────────────────────────────────────────
-        self._last_train_time = datetime.utcnow()
-        self._last_train_acc  = val_acc
-        self._n_train_bars    = len(X_train)
-        self._is_trained      = True
+            # ── Feature importance ─────────────────────────────────────────
+            feature_importance = pd.Series(
+                model.feature_importances_,
+                index=feature_cols
+            ).sort_values(ascending=False)
+
+            # ── Atomically commit all state ───────────────────────────────
+            self._model              = model
+            self._scaler             = scaler
+            self._feature_cols       = feature_cols
+            self._feature_importance = feature_importance
+            self._last_train_time    = datetime.utcnow()
+            self._last_train_acc     = val_acc
+            self._n_train_bars       = len(X_train)
+            self._is_trained         = True
 
         acc_grade = ('GOOD' if val_acc > 0.55 else
                      'FAIR' if val_acc > 0.52 else 'WEAK')
 
         logger.info(f"[Model] Trained | bars={len(feat_df)} | "
                     f"val_acc={val_acc:.2%} ({acc_grade}) | "
-                    f"features={len(self._feature_cols)} | "
+                    f"features={len(feature_cols)} | "
                     f"horizon={self.horizon}")
 
         return {
@@ -170,7 +202,7 @@ class IntradaySignalModel:
             'val_accuracy' : round(val_acc, 4),
             'n_train_bars' : len(X_train),
             'n_val_bars'   : len(X_val),
-            'n_features'   : len(self._feature_cols),
+            'n_features'   : len(feature_cols),
             'trained_at'   : self._last_train_time.isoformat(),
             'acc_grade'    : acc_grade,
             'top_features' : self._feature_importance.head(5).to_dict(),

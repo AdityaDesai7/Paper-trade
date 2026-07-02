@@ -85,10 +85,14 @@ class PaperTradingEngine:
         # Apply the requested timeframe — sets all config module-level vars
         cfg.apply_timeframe(timeframe)
 
-        self.loop_interval = cfg.LOOP_INTERVAL_SECS
-        self._running      = False
-        self._thread       = None
-        self._start_time   = None
+        self.loop_interval  = cfg.LOOP_INTERVAL_SECS
+        self._running       = False
+        self._thread        = None
+        self._start_time    = None
+        # Prevents concurrent switch_timeframe() calls from spawning multiple loops
+        self._switch_lock   = threading.Lock()
+        # Event used to interrupt the sleep phase so stop() is instant
+        self._stop_event    = threading.Event()
 
         # ── Core components ──────────────────────────────────────────────────
         self.trade_log    = TradeLog(cfg.DB_PATH)
@@ -133,6 +137,7 @@ class PaperTradingEngine:
         if self._running:
             logger.warning("[Engine] Already running.")
             return
+        self._stop_event.clear()
         self._running    = True
         self._start_time = datetime.utcnow()
         self._thread = threading.Thread(target=self._loop,
@@ -141,10 +146,17 @@ class PaperTradingEngine:
         logger.info("[Engine] Trading loop started.")
 
     def stop(self):
-        """Gracefully stop the trading loop."""
+        """
+        Gracefully stop the trading loop.
+        Sets _stop_event so the sleep phase wakes up immediately instead of
+        waiting for the full loop interval (which could be 3600s on 1h TF).
+        """
         self._running = False
-        if self._thread:
-            self._thread.join(timeout=15)
+        self._stop_event.set()      # wake the sleeping loop immediately
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=30)
+            if self._thread.is_alive():
+                logger.warning("[Engine] Loop thread did not exit within 30s — continuing anyway")
         logger.info("[Engine] Trading loop stopped.")
 
     def run_once(self) -> dict:
@@ -182,34 +194,48 @@ class PaperTradingEngine:
         """
         Switch the engine to a different trading timeframe at runtime.
 
-        Stops the loop, applies the new config, resets the model
-        (so it retrains on the new bar size), then restarts the loop.
+        Thread-safe: uses _switch_lock so rapid API clicks cannot spawn
+        multiple concurrent loops. Also ignores no-op same-TF switches.
 
-        Returns dict with new settings for the API caller.
+        Stops the loop (waking the sleep immediately via _stop_event),
+        applies new config, resets the model, then restarts.
         """
         if timeframe not in cfg.TIMEFRAME_CONFIGS:
             raise ValueError(f"Unknown timeframe '{timeframe}'. "
                              f"Valid: {list(cfg.TIMEFRAME_CONFIGS.keys())}")
 
-        logger.info(f"[Engine] Switching timeframe: {cfg.ACTIVE_TIMEFRAME} → {timeframe}")
+        # Serialize all switch calls — only one can run at a time
+        with self._switch_lock:
+            # Ignore no-op: switching to the already-active timeframe
+            if timeframe == cfg.ACTIVE_TIMEFRAME:
+                logger.info(f"[Engine] switch_timeframe({timeframe}): already on this TF, skipping")
+                return {
+                    'timeframe'   : cfg.ACTIVE_TIMEFRAME,
+                    'loop_secs'   : cfg.LOOP_INTERVAL_SECS,
+                    'horizon'     : cfg.PREDICT_HORIZON,
+                    'min_train'   : cfg.MIN_TRAIN_BARS,
+                    'retrain_mins': cfg.RETRAIN_EVERY_MINS,
+                }
 
-        was_running = self._running
-        if was_running:
-            self.stop()
+            logger.info(f"[Engine] Switching timeframe: {cfg.ACTIVE_TIMEFRAME} → {timeframe}")
 
-        # Apply new timeframe settings
-        cfg.apply_timeframe(timeframe)
-        self.loop_interval = cfg.LOOP_INTERVAL_SECS
+            was_running = self._running
+            if was_running:
+                self.stop()  # wakes sleep via _stop_event, joins thread
 
-        # Reset model so it retrains on first cycle with new bar size
-        self.model = IntradaySignalModel()
-        self.model.refresh_from_config()
+            # Apply new timeframe settings
+            cfg.apply_timeframe(timeframe)
+            self.loop_interval = cfg.LOOP_INTERVAL_SECS
 
-        logger.info(f"[Engine] Timeframe switched to {timeframe} "
-                    f"(loop={self.loop_interval}s, horizon={cfg.PREDICT_HORIZON}bars)")
+            # Reset model so it retrains fresh on the new bar size
+            self.model = IntradaySignalModel()
+            self.model.refresh_from_config()
 
-        if was_running:
-            self.start()
+            logger.info(f"[Engine] Timeframe switched to {timeframe} "
+                        f"(loop={self.loop_interval}s, horizon={cfg.PREDICT_HORIZON}bars)")
+
+            if was_running:
+                self.start()
 
         return {
             'timeframe'   : cfg.ACTIVE_TIMEFRAME,
@@ -237,7 +263,9 @@ class PaperTradingEngine:
             elapsed   = time.time() - cycle_start
             sleep_for = max(0, self.loop_interval - elapsed)
             logger.debug(f"[Engine] Cycle took {elapsed:.1f}s — sleeping {sleep_for:.1f}s")
-            time.sleep(sleep_for)
+            # Use event.wait() instead of time.sleep() so stop() wakes us instantly
+            # (prevents waiting up to 3600s on 1h timeframe before a switch takes effect)
+            self._stop_event.wait(timeout=sleep_for)
 
     # ── Single Cycle ──────────────────────────────────────────────────────────
     def _cycle(self) -> dict:
@@ -323,10 +351,13 @@ class PaperTradingEngine:
 
         # ── Step 9: Log portfolio snapshot ────────────────────────────────────
         snap = self.portfolio.get_snapshot(self.last_price)
+        pos_label = 'FLAT'
+        if snap.get('open_position'):
+            pos_label = snap['open_position'].get('side', 'OPEN').upper()
         logger.info(
             f"[Engine] Portfolio | equity=${snap['equity']:,.2f} | "
             f"return={snap['total_return_pct']:+.3f}% | "
-            f"position={'LONG/SHORT' if snap['open_position'] else 'FLAT'} | "
+            f"position={pos_label} | "
             f"trades={snap['total_trades']}"
         )
 
