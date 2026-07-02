@@ -448,8 +448,10 @@ class Portfolio:
             unrealized = 0.0
             if self.position is not None:
                 unrealized = self.position.unrealized_pnl(current_price)
-
-            equity = self.cash + unrealized
+                locked_notional = self.position.entry_price * self.position.qty
+                equity = self.cash + locked_notional + unrealized
+            else:
+                equity = self.cash
             self._record_snapshot(equity)
 
             # Reset daily tracking if new day
@@ -463,10 +465,23 @@ class Portfolio:
 
     # ── Account Metrics ───────────────────────────────────────────────────────
     def get_equity(self, current_price: float = None) -> float:
-        """Total account value (cash + unrealized P&L)."""
+        """
+        True account equity = cash + full position value.
+
+        When a position is open, cash was reduced by (entry_price * qty) at entry.
+        That capital is still yours — it's locked in the position.
+        So equity = cash + entry_price*qty + unrealized_pnl(current_price)
+                   = cash + current_price * qty  (for LONG)
+                   = cash + entry_price*qty + (entry-current)*qty  (for SHORT)
+
+        Without adding back entry_price*qty the display shows cash-only, which
+        makes a $37k position look like a $37k loss.
+        """
         if self.position is None or current_price is None:
             return self.cash
-        return self.cash + self.position.unrealized_pnl(current_price)
+        unrealized = self.position.unrealized_pnl(current_price)
+        locked_notional = self.position.entry_price * self.position.qty
+        return self.cash + locked_notional + unrealized
 
     def get_total_return_pct(self, current_price: float = None) -> float:
         equity = self.get_equity(current_price)
@@ -524,7 +539,13 @@ class Portfolio:
                     'entry_time'    : self.position.entry_time.isoformat(),
                 }
 
-            equity = self.cash + unrealized
+            # True equity = cash + locked notional + unrealized PnL
+            # (locked notional = entry_price * qty, removed from cash on open)
+            if self.position is not None and current_price:
+                locked_notional = self.position.entry_price * self.position.qty
+                equity = self.cash + locked_notional + unrealized
+            else:
+                equity = self.cash
 
             return {
                 'cash'             : round(self.cash, 2),
