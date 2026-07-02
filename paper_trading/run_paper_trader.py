@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 # ============================================================================
-# PETROQUANT PAPER TRADING — ENTRY POINT
+# PETROQUANT PAPER TRADING — ENTRY POINT (multi-strategy v2.0)
 # ============================================================================
+# Boots all 4 strategy runners simultaneously:
+#   5m  — fetches 5m WTI candles, predicts 15min ahead, trades every 5min
+#   15m — fetches 15m WTI candles, predicts 30min ahead, trades every 15min
+#   1h  — fetches 1h  WTI candles, predicts 2h ahead,   trades every 1h
+#   1d  — fetches 1d  WTI candles, predicts next day,   trades once daily
+#
+# Each strategy has its own: model, portfolio, trade DB, loop thread.
+# No shared state. No global config mutations.
+#
 # Run modes:
-#   python run_paper_trader.py                       → full engine + web server
-#   python run_paper_trader.py --timeframe 5m        → run on 5m candles
-#   python run_paper_trader.py --once                → run one cycle and exit
-#   python run_paper_trader.py --dashboard           → generate dashboard only
-#   python run_paper_trader.py --reset               → reset paper account
-#   python run_paper_trader.py --status              → print current status
-#   python run_paper_trader.py --no-server           → engine without web server
-#
-# Valid timeframes: 1m (default), 5m, 15m, 1h, 1d
-#
-# Bug #13 fix: --timeframe CLI argument added.
+#   python paper_trading/run_paper_trader.py              → full engine (default)
+#   python paper_trading/run_paper_trader.py --status     → print current status
+#   python paper_trading/run_paper_trader.py --no-server  → engine without web server
 # ============================================================================
 
 import sys
@@ -23,120 +24,68 @@ import time
 import signal
 import logging
 
-# ── Ensure project root is on the path ───────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from paper_trading import config as cfg
-from paper_trading.engine     import PaperTradingEngine
+from paper_trading.engine     import MultiStrategyEngine
+from paper_trading.dashboard_live import LiveDashboard
 from paper_trading.web_server import create_web_server, run_web_server
 
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description='PetroQuant Paper Trading Engine',
+        description='PetroQuant Multi-Strategy Paper Trading Engine',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+All 4 strategies (5m, 15m, 1h, 1d) run simultaneously.
+Each has its own portfolio, model, and database.
+
 Examples:
-  python paper_trading/run_paper_trader.py                    # 1m candles (default)
-  python paper_trading/run_paper_trader.py --timeframe 5m     # 5-minute candles
-  python paper_trading/run_paper_trader.py --timeframe 15m    # 15-minute candles
-  python paper_trading/run_paper_trader.py --timeframe 1h     # 1-hour candles
-  python paper_trading/run_paper_trader.py --timeframe 1d     # Daily candles
-  python paper_trading/run_paper_trader.py --once             # One cycle, then exit
-  python paper_trading/run_paper_trader.py --dashboard        # Dashboard only
-  python paper_trading/run_paper_trader.py --status           # Account status
-  python paper_trading/run_paper_trader.py --reset            # Reset account
+  python paper_trading/run_paper_trader.py           # Start all strategies
+  python paper_trading/run_paper_trader.py --status  # Print status and exit
+  python paper_trading/run_paper_trader.py --no-server  # No web UI
         """
     )
-    # Bug #13 fix: timeframe argument (1m removed — minimum is 5m)
-    parser.add_argument(
-        '--timeframe', '-tf',
-        default='5m',
-        choices=list(cfg.TIMEFRAME_CONFIGS.keys()),
-        help='Trading timeframe: 5m (default), 15m, 1h, 1d'
-    )
-    parser.add_argument('--once',      action='store_true', help='Run one cycle and exit')
-    parser.add_argument('--dashboard', action='store_true', help='Generate dashboard and exit')
-    parser.add_argument('--reset',     action='store_true', help='Reset paper account')
-    parser.add_argument('--status',    action='store_true', help='Print account status')
-    parser.add_argument('--no-server', action='store_true', help='Run engine without web server')
+    parser.add_argument('--status',    action='store_true',
+                        help='Print current status for all strategies and exit')
+    parser.add_argument('--no-server', action='store_true',
+                        help='Run engine without web server')
     args = parser.parse_args()
 
-    _print_banner(args.timeframe)
+    _print_banner()
 
-    # ── Initialize engine (applies timeframe config) ─────────────────────────
-    engine = PaperTradingEngine(timeframe=args.timeframe)
-
-    # ── Mode: reset ──────────────────────────────────────────────────────────
-    if args.reset:
-        confirm = input("\n⚠  Reset paper account? This deletes ALL trades. Type 'yes' to confirm: ")
-        if confirm.strip().lower() == 'yes':
-            engine.reset_account()
-            print("✓ Account reset to ${:,.0f}".format(cfg.INITIAL_CAPITAL))
-        else:
-            print("✗ Reset cancelled.")
-        return
+    # Initialize multi-strategy engine
+    engine = MultiStrategyEngine()
 
     # ── Mode: status ─────────────────────────────────────────────────────────
     if args.status:
-        trade_log = engine.trade_log
-        summary   = trade_log.get_summary()
-        snap      = engine.portfolio.get_snapshot()
-        print("\n" + "=" * 60)
-        print("  PetroQuant Paper Trading — Account Status")
-        print("=" * 60)
-        print(f"  Timeframe      : {cfg.ACTIVE_TIMEFRAME} ({cfg.get_timeframe_label()})")
-        print(f"  Capital        : ${cfg.INITIAL_CAPITAL:,.2f}")
-        print(f"  Equity         : ${summary.get('latest_equity', cfg.INITIAL_CAPITAL):,.2f}")
-        print(f"  Total Return   : {summary.get('total_return_pct', 0):+.3f}%")
-        print(f"  Realized P&L   : ${summary.get('total_realized_pnl', 0):+,.2f}")
-        print(f"  Total Trades   : {summary.get('total_trades', 0)}")
-        print(f"  Win Rate       : {summary.get('win_rate_pct', 0):.1f}%")
-        print(f"  Max Drawdown   : {summary.get('max_drawdown_pct', 0):.2f}%")
-        print(f"  Commission Paid: ${summary.get('total_commission', 0):,.2f}")
-        print(f"  First Trade    : {summary.get('first_trade', 'N/A')}")
-        print(f"  Last Trade     : {summary.get('last_trade', 'N/A')}")
-        print("=" * 60)
-        return
-
-    # ── Mode: dashboard only ──────────────────────────────────────────────────
-    if args.dashboard:
-        from paper_trading.price_feed   import fetch_candles, fetch_latest_price
-        from paper_trading.daily_regime import DailyRegimeDetector
-        from paper_trading.dashboard_live import LiveDashboard
-
-        print(f"\n[Dashboard] Fetching {cfg.ACTIVE_TIMEFRAME} candles...")
-        price_df = fetch_candles(interval=cfg.CANDLE_INTERVAL, days=cfg.BARS_TO_FETCH)
-        current  = fetch_latest_price()
-        regime, _ = DailyRegimeDetector().get_regime()
-
-        dash = LiveDashboard(engine.trade_log, engine.portfolio, price_df)
-        html = dash.render(current_price=current, regime=regime)
-        path = dash.save(html)
-        print(f"[Dashboard] Saved → {path}")
-        print(f"[Dashboard] Open in browser: file://{path}")
-        return
-
-    # ── Mode: once ────────────────────────────────────────────────────────────
-    if args.once:
-        print(f"\n[Engine] Running single cycle (timeframe: {cfg.ACTIVE_TIMEFRAME})...")
-        result = engine.run_once()
-        print(f"\n[Engine] Result: {result}")
-        print(f"[Engine] Dashboard: {cfg.DASHBOARD_PATH}")
+        print("\n" + "=" * 70)
+        print("  PetroQuant — Multi-Strategy Status")
+        print("=" * 70)
+        for tf, runner in engine.strategies.items():
+            snap    = runner.portfolio.get_snapshot()
+            summary = runner.trade_log.get_summary()
+            print(f"\n  [{tf}] {runner._label}")
+            print(f"    Interval  : {runner._candle_interval} candles")
+            print(f"    Horizon   : {runner._horizon} bars ahead")
+            print(f"    Equity    : ${snap.get('equity', cfg.INITIAL_CAPITAL):,.2f}")
+            print(f"    Return    : {snap.get('total_return_pct', 0):+.3f}%")
+            print(f"    Trades    : {summary.get('total_trades', 0)}")
+            print(f"    Win Rate  : {summary.get('win_rate_pct', 0):.1f}%")
+            print(f"    DB File   : paper_trades_{tf}.db")
+        print("=" * 70)
         return
 
     # ── Mode: full engine (default) ───────────────────────────────────────────
+    dashboard = LiveDashboard(engine=engine)
+
     engine_ref = {
         'engine'   : engine,
-        'portfolio': engine.portfolio,
-        'trade_log': engine.trade_log,
-        'dashboard': engine.dashboard,
+        'dashboard': dashboard,
     }
 
-    # Start web server (unless --no-server)
     if not args.no_server:
         app = create_web_server(engine_ref)
         run_web_server(app, port=cfg.WEB_PORT)
@@ -144,26 +93,26 @@ Examples:
         print(f"  Dashboard  : http://localhost:{cfg.WEB_PORT}/")
         print(f"  Status     : http://localhost:{cfg.WEB_PORT}/status")
         print(f"  Trades     : http://localhost:{cfg.WEB_PORT}/trades")
-        print(f"  Timeframe  : http://localhost:{cfg.WEB_PORT}/set-timeframe (POST)")
+        print(f"  Health     : http://localhost:{cfg.WEB_PORT}/health")
+        print(f"  Reset      : http://localhost:{cfg.WEB_PORT}/reset")
 
-    # Start trading loop in background
-    engine.start()
-    print(f"\n[OK] Paper trading engine started ({cfg.ACTIVE_TIMEFRAME} candles). "
-          f"Press Ctrl+C to stop.\n")
+    # Start all 4 trading loops
+    engine.start_all()
+    print(f"\n[OK] All 4 strategies started. Press Ctrl+C to stop.\n")
 
-    # ── Graceful shutdown on Ctrl+C ───────────────────────────────────────────
+    # Graceful shutdown
     def _shutdown(sig, frame):
-        print("\n\n[Engine] Shutting down gracefully...")
-        engine.stop()
-        snap = engine.portfolio.get_snapshot(engine.last_price)
-        print(f"[Engine] Final equity: ${snap['equity']:,.2f} "
-              f"({snap['total_return_pct']:+.3f}%)")
+        print("\n\n[Engine] Shutting down all strategies...")
+        engine.stop_all()
+        for tf, runner in engine.strategies.items():
+            snap = runner.portfolio.get_snapshot(runner.last_price)
+            print(f"  [{tf}] Final equity: ${snap['equity']:,.2f} "
+                  f"({snap['total_return_pct']:+.3f}%)")
         sys.exit(0)
 
     signal.signal(signal.SIGINT,  _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    # Keep main thread alive
     try:
         while True:
             time.sleep(10)
@@ -171,27 +120,19 @@ Examples:
         pass
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-def _print_banner(timeframe: str = '1m'):
-    tf_info = cfg.TIMEFRAME_CONFIGS.get(timeframe, {})
-    label   = tf_info.get('label', timeframe)
-    horizon = tf_info.get('predict_horizon', 5)
-    loop    = tf_info.get('loop_secs', 60)
-
-    print(f"""
-==========================================================
-         PetroQuant - Paper Trading Engine v1.1           
-                                                          
-  Asset     : WTI Crude Oil Futures (CL=F)               
-  Timeframe : {label:<40}
-  Loop      : Every {loop}s                              
-  Signal    : XGBoost -> {horizon}-bar direction prediction  
-  Regime    : Daily HMM (BULL / CHOPPY / PANIC)           
-  Capital   : $1,000,000 paper USD                        
-==========================================================
+def _print_banner():
+    print("""
+=============================================================
+      PetroQuant - Multi-Strategy Paper Trading v2.0
+                                                           
+  Asset      : WTI Crude Oil Futures (CL=F)              
+  Strategies : 5m | 15m | 1h | 1d (all run in parallel)  
+  Capital    : $1,000,000 per strategy (independent)       
+  Signal     : XGBoost — per-TF data, per-TF prediction   
+  Regime     : Daily HMM (BULL / CHOPPY / PANIC)           
+=============================================================
 """)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     main()

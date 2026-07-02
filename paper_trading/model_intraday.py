@@ -71,17 +71,6 @@ class IntradaySignalModel:
         # Protects _model + _scaler from concurrent train() calls
         self._train_lock         = threading.Lock()
 
-    def refresh_from_config(self) -> None:
-        """
-        Re-read horizon / min_train_bars / retrain_every_mins from the current
-        config. Call this after apply_timeframe() to keep the model in sync.
-        """
-        self.horizon            = cfg.PREDICT_HORIZON
-        self.min_train_bars     = cfg.MIN_TRAIN_BARS
-        self.retrain_every_mins = cfg.RETRAIN_EVERY_MINS
-        logger.info(f"[Model] Refreshed from config — "
-                    f"horizon={self.horizon}, min_bars={self.min_train_bars}, "
-                    f"retrain_mins={self.retrain_every_mins}")
 
     # ── Training ─────────────────────────────────────────────────────────────
     # Minimum val_acc required before a fresh model is accepted.
@@ -274,12 +263,12 @@ class IntradaySignalModel:
         """Returns feature importance Series, or None if not trained."""
         return self._feature_importance
 
-    def get_model_status(self) -> dict:
+    def get_model_status(self, timeframe: str = None) -> dict:
         """Returns current model state summary."""
         if not self._is_trained:
-            return {'trained': False, 'timeframe': cfg.ACTIVE_TIMEFRAME}
+            return {'trained': False, 'timeframe': timeframe or 'unknown'}
 
-        elapsed = (datetime.utcnow() - self._last_train_time).total_seconds() / 60
+        elapsed    = (datetime.utcnow() - self._last_train_time).total_seconds() / 60
         retrain_in = max(0, self.retrain_every_mins - elapsed)
 
         return {
@@ -291,5 +280,5 @@ class IntradaySignalModel:
             'retrain_due_in_mins': round(retrain_in, 1),
             'needs_retrain'      : self.should_retrain(),
             'horizon'            : self.horizon,
-            'timeframe'          : cfg.ACTIVE_TIMEFRAME,
+            'timeframe'          : timeframe or 'unknown',
         }
