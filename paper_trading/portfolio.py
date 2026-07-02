@@ -39,24 +39,26 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class Position:
-    """Represents a single open position."""
-    side        : str        # 'LONG' or 'SHORT'
-    qty         : float      # number of units
+    """Represents a single open position using Signed Quantity."""
+    qty         : float      # signed: > 0 for LONG, < 0 for SHORT
     entry_price : float      # average fill price (after slippage)
     entry_time  : datetime   = field(default_factory=datetime.utcnow)
     commission  : float      = 0.0
 
     @property
-    def direction(self) -> int:
-        return 1 if self.side == 'LONG' else -1
+    def side(self) -> str:
+        return 'LONG' if self.qty > 0 else 'SHORT'
 
     def unrealized_pnl(self, current_price: float) -> float:
-        return self.direction * self.qty * (current_price - self.entry_price)
+        # PnL = Signed_Quantity * (Exit_Price - Entry_Price)
+        return self.qty * (current_price - self.entry_price)
 
     def unrealized_pct(self, current_price: float) -> float:
         if self.entry_price == 0:
             return 0.0
-        return self.direction * (current_price - self.entry_price) / self.entry_price
+        # (current - entry) / entry for LONG, (entry - current) / entry for SHORT
+        direction = 1 if self.qty > 0 else -1
+        return direction * (current_price - self.entry_price) / self.entry_price
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -239,16 +241,20 @@ class Portfolio:
                 # Restore open position if it existed
                 if 'open_position' in state:
                     pos_data = state['open_position']
+                    # Handle backward compatibility: if old JSON had positive qty + 'SHORT' side
+                    saved_qty = pos_data['qty']
+                    if pos_data.get('side') == 'SHORT' and saved_qty > 0:
+                        saved_qty = -saved_qty
+                        
                     self.position = Position(
-                        side        = pos_data['side'],
-                        qty         = pos_data['qty'],
+                        qty         = saved_qty,
                         entry_price = pos_data['entry_price'],
                         entry_time  = datetime.fromisoformat(pos_data['entry_time']),
                         commission  = pos_data.get('commission', 0.0),
                     )
                     logger.info(
-                        f"[Portfolio] Restored open {pos_data['side']} position: "
-                        f"{pos_data['qty']:.4f} units @ ${pos_data['entry_price']:.4f}"
+                        f"[Portfolio] Restored open {self.position.side} position: "
+                        f"{self.position.qty:.4f} units @ ${self.position.entry_price:.4f}"
                     )
                 else:
                     self.position = None
@@ -308,6 +314,7 @@ class Portfolio:
                 return {'status': 'rejected', 'reason': 'daily_loss_limit'}
 
             fill_price = market_price * (1 + self.slippage_pct)
+            qty = abs(qty)
             cost       = fill_price * qty
             commission = cost * self.commission_pct
 
@@ -318,9 +325,10 @@ class Portfolio:
                 cost       = fill_price * qty
                 commission = cost * self.commission_pct
 
+            # Pure Cash Flow: Money leaves the account when buying
             self.cash -= (cost + commission)
             self.total_commission += commission
-            self.position = Position(side='LONG', qty=qty, entry_price=fill_price,
+            self.position = Position(qty=qty, entry_price=fill_price,
                                      commission=commission)
             self.total_trades += 1
 
@@ -353,20 +361,19 @@ class Portfolio:
                 return {'status': 'rejected', 'reason': 'daily_loss_limit'}
 
             fill_price  = market_price * (1 - self.slippage_pct)
-            notional    = fill_price * qty
-            commission  = notional * self.commission_pct
+            signed_qty  = -abs(qty)  # Negative quantity for SHORT
+            proceeds    = fill_price * abs(signed_qty)
+            commission  = proceeds * self.commission_pct
 
-            if notional + commission > self.cash:
-                return {'status': 'rejected', 'reason': 'insufficient_cash'}
-
-            self.cash -= (notional + commission)   # lock notional + commission
+            # Pure Cash Flow: Money enters the account when short selling (minus commission)
+            self.cash += (proceeds - commission)
             self.total_commission += commission
-            self.position = Position(side='SHORT', qty=qty, entry_price=fill_price,
+            self.position = Position(qty=signed_qty, entry_price=fill_price,
                                      commission=commission)
             self.total_trades += 1
 
-            logger.info(f"[Portfolio] OPEN SHORT {qty:.4f} units @ ${fill_price:.4f} "
-                        f"| notional=${notional:.2f} | commission=${commission:.2f} "
+            logger.info(f"[Portfolio] OPEN SHORT {signed_qty:.4f} units @ ${fill_price:.4f} "
+                        f"| proceeds=${proceeds:.2f} | commission=${commission:.2f} "
                         f"| cash=${self.cash:,.2f}")
 
             # Persist state after trade
@@ -375,9 +382,9 @@ class Portfolio:
             return {
                 'status'     : 'filled',
                 'side'       : 'SHORT',
-                'qty'        : qty,
+                'qty'        : signed_qty,
                 'fill_price' : fill_price,
-                'notional'   : notional,
+                'proceeds'   : proceeds,
                 'commission' : commission,
             }
 
@@ -388,23 +395,26 @@ class Portfolio:
                 return {'status': 'no_position'}
 
             pos = self.position
-            if pos.side == 'LONG':
-                fill_price  = market_price * (1 - self.slippage_pct)   # exit lower
-                pnl         = (fill_price - pos.entry_price) * pos.qty
-                proceeds    = fill_price * pos.qty
-                self.cash  += proceeds
+            if pos.qty > 0:  # Closing LONG
+                fill_price = market_price * (1 - self.slippage_pct)   # exit lower
+                proceeds   = fill_price * pos.qty
+                commission = proceeds * self.commission_pct
+                # Pure Cash Flow: Money enters the account when selling
+                self.cash += (proceeds - commission)
 
-            else:  # SHORT — return locked notional + capture P&L
-                fill_price  = market_price * (1 + self.slippage_pct)   # exit higher (worse)
-                pnl         = (pos.entry_price - fill_price) * pos.qty
-                notional_at_entry = pos.entry_price * pos.qty
-                self.cash  += notional_at_entry + pnl
+            else:  # Closing SHORT
+                fill_price = market_price * (1 + self.slippage_pct)   # exit higher (worse)
+                cost       = fill_price * abs(pos.qty)
+                commission = cost * self.commission_pct
+                # Pure Cash Flow: Money leaves the account when buying back
+                self.cash -= (cost + commission)
 
-            commission       = abs(fill_price * pos.qty * self.commission_pct)
-            self.cash       -= commission
+            # Universal PnL formula with Signed Quantity
+            pnl = pos.qty * (fill_price - pos.entry_price)
+
             self.total_commission += commission
+            net_pnl = pnl - commission - pos.commission
 
-            net_pnl           = pnl - commission - pos.commission
             self.realized_pnl += net_pnl
             self._daily_pnl  += net_pnl
 
@@ -448,8 +458,8 @@ class Portfolio:
             unrealized = 0.0
             if self.position is not None:
                 unrealized = self.position.unrealized_pnl(current_price)
-                locked_notional = self.position.entry_price * self.position.qty
-                equity = self.cash + locked_notional + unrealized
+                # Universal Equity formula with Pure Cash Flow
+                equity = self.cash + (current_price * self.position.qty)
             else:
                 equity = self.cash
             self._record_snapshot(equity)
@@ -466,22 +476,12 @@ class Portfolio:
     # ── Account Metrics ───────────────────────────────────────────────────────
     def get_equity(self, current_price: float = None) -> float:
         """
-        True account equity = cash + full position value.
-
-        When a position is open, cash was reduced by (entry_price * qty) at entry.
-        That capital is still yours — it's locked in the position.
-        So equity = cash + entry_price*qty + unrealized_pnl(current_price)
-                   = cash + current_price * qty  (for LONG)
-                   = cash + entry_price*qty + (entry-current)*qty  (for SHORT)
-
-        Without adding back entry_price*qty the display shows cash-only, which
-        makes a $37k position look like a $37k loss.
+        True account equity using Pure Cash Flow.
+        Universal formula: Equity = Cash + (Current_Price * Signed_Qty)
         """
         if self.position is None or current_price is None:
             return self.cash
-        unrealized = self.position.unrealized_pnl(current_price)
-        locked_notional = self.position.entry_price * self.position.qty
-        return self.cash + locked_notional + unrealized
+        return self.cash + (current_price * self.position.qty)
 
     def get_total_return_pct(self, current_price: float = None) -> float:
         equity = self.get_equity(current_price)
@@ -539,11 +539,9 @@ class Portfolio:
                     'entry_time'    : self.position.entry_time.isoformat(),
                 }
 
-            # True equity = cash + locked notional + unrealized PnL
-            # (locked notional = entry_price * qty, removed from cash on open)
+            # True equity = cash + current position value
             if self.position is not None and current_price:
-                locked_notional = self.position.entry_price * self.position.qty
-                equity = self.cash + locked_notional + unrealized
+                equity = self.cash + (current_price * self.position.qty)
             else:
                 equity = self.cash
 
