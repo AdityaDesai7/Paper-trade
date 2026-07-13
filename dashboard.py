@@ -305,6 +305,77 @@ def _equity(cash: float, position: Optional[OpenPosition], price: float) -> floa
     return cash + _unrealized_pnl(position, price)
 
 
+def _effective_signed_frac(position: Optional[OpenPosition], equity: float) -> float:
+    """
+    Live exposure as a signed fraction of current equity.
+
+    entry_notional is fixed at open; equity moves — so this can drift above the
+    original signed_frac after losses (hidden leverage).
+    """
+    if position is None or equity <= 0:
+        return 0.0
+    sign = 1.0 if position.side == 'LONG' else -1.0
+    return sign * (position.entry_notional / equity)
+
+
+def _apply_exposure_cap(
+    target_frac: float,
+    position: Optional[OpenPosition],
+    equity: float,
+) -> float:
+    """
+    Clip strategy target so gross notional never exceeds MAX_TOTAL_EXPOSURE × equity.
+
+    Also de-leverages when equity shrinks and optional pyramiding is disabled.
+    """
+    max_total = cfg.MAX_TOTAL_EXPOSURE
+    if equity <= 0:
+        return 0.0
+
+    target_frac = float(np.clip(target_frac, -max_total, max_total))
+    if position is None:
+        return target_frac
+
+    eff = _effective_signed_frac(position, equity)
+    eff_sign = 1 if eff > 1e-12 else (-1 if eff < -1e-12 else 0)
+    tgt_sign = 1 if target_frac > 1e-12 else (-1 if target_frac < -1e-12 else 0)
+
+    # Equity fell → effective exposure above book cap → force reduction
+    if abs(eff) > max_total + 1e-10:
+        cap_target = max_total * (1.0 if eff > 0 else -1.0)
+        if tgt_sign == 0 or tgt_sign != (1 if eff > 0 else -1):
+            return cap_target
+        return cap_target if abs(target_frac) >= abs(cap_target) else target_frac
+
+    if not cfg.ALLOW_PYRAMIDING and eff_sign != 0:
+        if tgt_sign == eff_sign and abs(target_frac) > abs(eff) + 1e-10:
+            return eff
+
+    # Same-side scale-in: cap notional at max_total × equity
+    if eff_sign != 0 and tgt_sign == eff_sign:
+        max_notional = max_total * equity
+        desired_notional = min(abs(target_frac) * equity, max_notional)
+        return (desired_notional / equity) * eff_sign
+
+    return target_frac
+
+
+def _cap_scale_in_delta(
+    position: OpenPosition,
+    delta: float,
+    equity: float,
+) -> float:
+    """Limit a same-side scale-in so total notional stays within the book cap."""
+    if equity <= 0 or abs(delta) <= 1e-12:
+        return 0.0
+    max_notional = cfg.MAX_TOTAL_EXPOSURE * equity
+    room = max_notional - position.entry_notional
+    if room <= 1e-10:
+        return 0.0
+    max_delta = room / equity
+    return np.sign(delta) * min(abs(delta), max_delta)
+
+
 def _rebalance(
     position: Optional[OpenPosition],
     target_frac: float,
@@ -327,7 +398,7 @@ def _rebalance(
     cash_delta       = 0.0
     gross_cash_delta = 0.0
     n_legs           = 0
-    current_frac     = position.signed_frac if position else 0.0
+    current_frac     = _effective_signed_frac(position, equity)
 
     if abs(target_frac - current_frac) < 1e-10:
         return position, cash_delta, gross_cash_delta, n_legs
@@ -346,8 +417,8 @@ def _rebalance(
 
     # ── REDUCE or FULL CLOSE (same side or going flat) ───────────────────
     if position is not None:
-        cur_abs = abs(position.signed_frac)
-        if target_frac * position.signed_frac >= 0:
+        cur_abs = abs(_effective_signed_frac(position, equity))
+        if target_frac * current_frac >= 0:
             new_abs = abs(target_frac)
         else:
             new_abs = 0.0
@@ -364,7 +435,7 @@ def _rebalance(
                 n_legs           += 1
 
     # ── INCREASE or NEW OPEN ─────────────────────────────────────────────
-    current_frac = position.signed_frac if position else 0.0
+    current_frac = _effective_signed_frac(position, equity)
     delta        = target_frac - current_frac
 
     if abs(delta) > 1e-10:
@@ -379,6 +450,9 @@ def _rebalance(
 
         elif (delta > 0 and position.side == 'LONG') or \
              (delta < 0 and position.side == 'SHORT'):
+            delta = _cap_scale_in_delta(position, delta, equity)
+            if abs(delta) <= 1e-12:
+                return position, cash_delta, gross_cash_delta, n_legs
             position, open_cost = _merge_positions(
                 position, abs(delta), price, equity,
                 commission_pct, slippage_pct,
@@ -404,6 +478,8 @@ def simulate_position_lifecycle(
       - A flip (long→short) = close entire old position, then open new one.
       - Partial closes reduce open quantity; scale-ins use weighted average cost.
       - MIN_REBALANCE_FRAC: ignore position changes smaller than this (no micro-trades).
+      - MAX_TOTAL_EXPOSURE: cap gross notional / current equity (de-leverage on equity drops).
+      - ALLOW_PYRAMIDING: when False, block same-side scale-ins.
       - STOP_LOSS_PCT: force-close if unrealized loss exceeds this fraction of notional.
       - MAX_HOLD_DAYS: force-close positions held beyond this many calendar days.
       - gross_pnl is at raw MARKET prices; slippage and commission deducted in net_pnl.
@@ -439,6 +515,23 @@ def simulate_position_lifecycle(
         ts          = idx[i]
         price       = float(prices.iloc[i])
         target_frac = float(target_fractions.iloc[i])
+        equity_now  = _equity(cash, position, price)
+
+        # ── DE-LEVERAGE if equity shrink pushed exposure above book cap ───
+        if position is not None and equity_now > 0:
+            eff = _effective_signed_frac(position, equity_now)
+            if abs(eff) > cfg.MAX_TOTAL_EXPOSURE + 1e-10:
+                cap_target = cfg.MAX_TOTAL_EXPOSURE * (1.0 if eff > 0 else -1.0)
+                position, cash_d, gross_d, n_legs = _rebalance(
+                    position, cap_target, price, equity_now,
+                    commission_pct, slippage_pct, ts, closed_trades,
+                    close_reason='exposure_cap',
+                )
+                cash       += cash_d
+                gross_cash += gross_d
+                n_transitions += n_legs
+                equity_now = _equity(cash, position, price)
+
         current_frac = position.signed_frac if position else 0.0
 
         # ── STOP-LOSS check (before signal rebalance) ─────────────────────
@@ -455,6 +548,7 @@ def simulate_position_lifecycle(
                 gross_cash += gross_d
                 n_transitions += n_legs
                 current_frac = 0.0
+                equity_now = _equity(cash, position, price)
 
         # ── MAX HOLD check ────────────────────────────────────────────────
         if position is not None:
@@ -470,11 +564,13 @@ def simulate_position_lifecycle(
                 gross_cash += gross_d
                 n_transitions += n_legs
                 current_frac = 0.0
+                equity_now = _equity(cash, position, price)
 
         # ── SIGNAL rebalance (only if change exceeds min threshold) ───────
-        current_frac = position.signed_frac if position else 0.0
-        if abs(target_frac - current_frac) >= min_rebal:
-            position_changes[i] = abs(target_frac - current_frac)
+        target_frac = _apply_exposure_cap(target_frac, position, equity_now)
+        current_eff = _effective_signed_frac(position, equity_now)
+        if abs(target_frac - current_eff) >= min_rebal:
+            position_changes[i] = abs(target_frac - current_eff)
             equity_now = _equity(cash, position, price)
             position, cash_d, gross_d, n_legs = _rebalance(
                 position, target_frac, price, equity_now,
@@ -488,7 +584,7 @@ def simulate_position_lifecycle(
         net_eq   = _equity(cash, position, price)
         gross_eq = gross_cash + (_unrealized_pnl(position, price) if position else 0.0)
 
-        held_fractions[i]   = position.signed_frac if position else 0.0
+        held_fractions[i]   = _effective_signed_frac(position, net_eq) if position else 0.0
         net_equity[i]       = net_eq
         gross_equity_arr[i] = gross_eq
 
@@ -759,6 +855,11 @@ class Backtester:
         # Hard cap: strategy.py should already enforce MAX_POSITION_PCT,
         # but clip here as a safety net against config changes between runs.
         position_series = position_series.clip(-cfg.MAX_POSITION_PCT, cfg.MAX_POSITION_PCT)
+        position_series = position_series.clip(-cfg.MAX_TOTAL_EXPOSURE, cfg.MAX_TOTAL_EXPOSURE)
+
+        print(f"     Exposure caps: per-trade ≤ {cfg.MAX_POSITION_PCT:.0%} | "
+              f"book ≤ {cfg.MAX_TOTAL_EXPOSURE:.0%} | "
+              f"pyramiding={'on' if cfg.ALLOW_PYRAMIDING else 'off'}")
 
         # ── Position-lifecycle simulation ────────────────────────────────
         sim = simulate_position_lifecycle(
